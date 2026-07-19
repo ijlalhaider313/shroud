@@ -1,0 +1,6 @@
+# shroud has no hard runtime dependencies — it runs on the Python 3 standard
+# library plus the mingw-w64 cross-compiler.
+#
+# Optional: only needed if you use the AES encryption-at-rest layer (-e aes).
+# The XOR/RC4 layers and everything else work without it.
+pycryptodome>=3.20

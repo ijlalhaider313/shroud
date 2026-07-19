@@ -1,0 +1,45 @@
+# ---- build artifacts ----
+out/
+*.exe
+*.dll
+*.o
+*.obj
+*.a
+*.lib
+build/
+dist/
+
+# ---- python ----
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# ---- never commit operational material ----
+# shellcode blobs, raw payloads, generated ciphertext/keys
+*.bin
+*.raw
+shellcode*
+sc_*
+payload_*
+*.shellcode
+*.key
+*.iv
+
+# ---- editor / OS ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ---- shroud authorization marker (normally in $HOME) ----
+.shroud_authorized
